@@ -63,6 +63,7 @@
           }
           return null;
         }
+
         function extractListId(loc) {
           var byList = getParam("list", loc.search);
           if (byList) return byList;
@@ -71,7 +72,7 @@
 
         var videoId = extractVideoId(window.location);
         var listId = extractListId(window.location);
-        console.log(window.location);
+
         if (!videoId) {
           document.title = "YouTube Embed Proxy";
           return;
@@ -86,226 +87,369 @@
         var start = getParam("start", window.location.search) || getParam("t", window.location.search);
         var startSec = start && /^\d+$/.test(start) ? Number(start) : null;
 
-        var player = null;
-        var pendingRate = null;
-        var lastRequestedRate = null; // remember last rate to re-apply after reloads
+        var candidateConfigs = [
+          { idSuffix: "primary" },
+          { idSuffix: "secondary" },
+          { idSuffix: "tertiary" },
+          { idSuffix: "quaternary" },
+          { idSuffix: "quinary" },
+          { idSuffix: "senary" },
+          { idSuffix: "septenary" },
+          { idSuffix: "octonary" },
+          { idSuffix: "nonary" },
+          { idSuffix: "denary" },
+          { idSuffix: "unary" },
+          { idSuffix: "binary" },
+          // { idSuffix: "nocookie", host: "https://www.youtube-nocookie.com" }
+        ];
 
-        // Progress tracking per videoId (in-memory only)
-        var progressByVideoId = Object.create(null);
-        var progressIntervalId = null;
-        var lastAdReloadAt = 0;
-        var adReloadCooldownMs = 1000; // avoid rapid reload loops
-
-        var lastTime = 0;
-        
-        // Background video player for ads
-        var backgroundPlayer = null;
-        var backgroundPlayerReady = false;
-        var isPlayingAdInBackground = false;
-
-        var detectionTimeInterval = 500;
-
-        function resetProgressFor(id) {
-          progressByVideoId[id] = { currentTime: 0, updatedAt: Date.now() };
+        function validatePlaybackRate(rate) {
+          var numeric = Number(rate);
+          if (!Number.isFinite(numeric) || numeric <= 0) return 1;
+          return numeric;
         }
 
-        function saveProgress(id, seconds) {
+        function createYouTubeApiScript() {
+          var tag = document.createElement("script");
+          tag.src = "https://www.youtube.com/iframe_api";
+          var firstScriptTag = document.getElementsByTagName("script")[0];
+          firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+        }
+
+        function YouTubePlayerController(options) {
+          this.videoId = options.videoId;
+          this.listId = options.listId;
+          this.startSeconds = options.startSeconds;
+          this.wrapperEl = options.wrapperEl;
+          this.candidateConfigs = Array.isArray(options.candidateConfigs) && options.candidateConfigs.length
+            ? options.candidateConfigs
+            : [{ idSuffix: "primary" }];
+
+          this.progressStore = Object.create(null);
+          this.pendingRate = null;
+          this.lastRequestedRate = null;
+          this.candidates = [];
+          this.activeCandidate = null;
+          this.progressIntervalId = null;
+          this.detectionInterval = 500;
+          this.lastAdReloadAt = 0;
+          this.adReloadCooldownMs = 1000;
+
+          this.resetProgress();
+          this.setupCandidateContainers();
+        }
+
+        YouTubePlayerController.prototype.resetProgress = function () {
+          this.progressStore[this.videoId] = { currentTime: 0, updatedAt: Date.now() };
+        };
+
+        YouTubePlayerController.prototype.saveProgress = function (seconds) {
           var sec = Number(seconds);
           if (!Number.isFinite(sec) || sec < 0) sec = 0;
-          progressByVideoId[id] = { currentTime: sec, updatedAt: Date.now() };
-        }
+          this.progressStore[this.videoId] = { currentTime: sec, updatedAt: Date.now() };
+        };
 
-        function readProgress(id) {
-          var obj = progressByVideoId[id];
+        YouTubePlayerController.prototype.readProgress = function () {
+          var obj = this.progressStore[this.videoId];
           var t = Number(obj && obj.currentTime);
           return Number.isFinite(t) && t >= 0 ? t : 0;
-        }
+        };
 
-        function safeSetRate(rate) {
-          var r = Number(rate);
-          if (!Number.isFinite(r) || r <= 0) r = 1;
-          try {
-            if (player && typeof player.setPlaybackRate === "function") {
-              player.setPlaybackRate(r);
-            } else {
-              pendingRate = r;
-            }
-          } catch (_) {
-            pendingRate = r;
-          }
-        }
+        YouTubePlayerController.prototype.setupCandidateContainers = function () {
+          if (!this.wrapperEl) return;
+          this.wrapperEl.innerHTML = "";
 
-        function createBackgroundPlayer() {
-          // Create hidden container for background player
-          var bgContainer = document.createElement("div");
-          bgContainer.id = "backgroundPlayer";
-          bgContainer.style.cssText = "position: absolute; top: 0px; left: 0px; width: 100px; height: 100px; opacity: 0.5; pointer-events: none;";
-          document.body.appendChild(bgContainer);
+          var self = this;
+          this.candidates = this.candidateConfigs.map(function (config, index) {
+            var suffix = config.idSuffix || "candidate-" + index;
+            var hostId = index === 0 ? "player" : "player-" + suffix;
 
-          // Initialize background player with YouTube API
-          backgroundPlayer = new YT.Player("backgroundPlayer", {
-            width: "1",
-            height: "1",
-            videoId: "dQw4w9WgXcQ", // Default video (Rick Roll as placeholder)
-            playerVars: {
-              autoplay: 0,
-              controls: 0,
-              disablekb: 1,
-              fs: 0,
-              modestbranding: 1,
-              rel: 0,
-              showinfo: 0,
-              mute: 1, // Mute the background player
-              playsinline: 1
-            },
-            events: {
-              onReady: function() {
-                backgroundPlayerReady = true;
-                console.log("Background player ready");
-              },
-              onStateChange: function(event) {
-                // Monitor background player state
-                if (event.data === YT.PlayerState.ENDED && isPlayingAdInBackground) {
-                  console.log("Background ad finished playing");
-                  isPlayingAdInBackground = false;
-                }
-              }
-            }
-          });
-        }
+            var container = document.createElement("div");
+            container.className = "player-slot-wrapper";
+            container.style.width = "100%";
+            container.style.height = "100%";
+            container.style.position = "relative";
+            container.style.display = "none";
 
-        function playAdInBackground(adVideoId) {
-          if (!backgroundPlayerReady || isPlayingAdInBackground) return;
-          
-          try {
-            console.log("Playing ad in background for 10 seconds:", adVideoId);
-            isPlayingAdInBackground = true;
-            
-            // Load and play the ad video in background
-            backgroundPlayer.loadVideoById({
-              videoId: adVideoId || "dQw4w9WgXcQ", // Fallback video
-              startSeconds: 0
-            });
-            
-            // Ensure it's muted and hidden
-            setTimeout(function() {
-              try {
-                backgroundPlayer.mute();
-                backgroundPlayer.playVideo();
-              } catch(e) {
-                console.log("Error controlling background player:", e);
-              }
-            }, 500);
-            
-            // Stop background ad after 10 seconds
-            setTimeout(function() {
-              try {
-                console.log("Stopping background ad after 10 seconds");
-                backgroundPlayer.pauseVideo();
-                backgroundPlayer.stopVideo();
-                isPlayingAdInBackground = false;
-              } catch(e) {
-                console.log("Error stopping background player:", e);
-                isPlayingAdInBackground = false;
-              }
-            }, 10000); // 10 seconds = 10000 milliseconds
-            
-          } catch(e) {
-            console.log("Error playing ad in background:", e);
-            isPlayingAdInBackground = false;
-          }
-        }
-        // Load YouTube Iframe API
-        // Reset progress when a new video id is loaded
-        resetProgressFor(videoId);
+            var host = document.createElement("div");
+            host.id = hostId;
+            host.className = "player-slot";
+            host.style.width = "100%";
+            host.style.height = "100%";
 
-        var tag = document.createElement("script");
-        tag.src = "https://www.youtube.com/iframe_api";
-        var firstScriptTag = document.getElementsByTagName("script")[0];
-        firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
-
-        window.onYouTubeIframeAPIReady = function () {
-          var playerVars = {
-            autoplay: 1,
-            playsinline: 1,
-            rel: 0,
-          };
-          if (listId) {
-            playerVars.listType = "playlist";
-            playerVars.list = listId;
-          }
-          if (startSec != null) playerVars.start = startSec;
-          console.log(playerVars);
-          player = new YT.Player("player", {
-            // host: "https://www.youtube-nocookie.com",
-            width: "100%",
-            height: "100%",
-            videoId: videoId,
-            playerVars: playerVars,
-            events: {
-              onReady: function () {
-                try { player.playVideo(); } catch (_) {}
-                if (pendingRate != null) {
-                  safeSetRate(pendingRate);
-                  pendingRate = null;
-                }
-
-                createBackgroundPlayer();
-
-                // Start 500ms interval to persist progress
-                try { if (progressIntervalId) clearInterval(progressIntervalId); } catch (_) {}
-                progressIntervalId = setInterval(function () {
-                  try {
-                    if (player && typeof player.getCurrentTime === "function") {
-                      var t = player.getCurrentTime();
-                      var s = player.getPlayerState();
-                      var d = player.getDuration();
-                      var data = player.getVideoData();
-                      var state = typeof player.getPlayerState === "function" ? player.getPlayerState() : null; // 1 = playing
-                      // console.log("getVideoData", player.getVideoData());
-                      // console.log("getDuration", d);
-                      // Heuristic: if total duration is very short, likely an ad
-                      if ((s === -1 && !(t == lastTime)  || data?.author == "")) {
-                        console.log("Ad detected", data);
-                        var now = Date.now();
-                        if (now - lastAdReloadAt > adReloadCooldownMs) {
-                          lastAdReloadAt = now;
-                          
-                          // Start playing an ad in background to simulate ad viewing
-                          playAdInBackground(videoId);
-                          
-                          // Reload the video to last saved progress
-                          var resumeAt = readProgress(videoId);
-                          console.log("Ad detected - playing ad in background and reloading main video", videoId, resumeAt);
-                          try {
-                            if (listId) {
-                              player.loadPlaylist({ playlistId: listId, startIndex: resumeAt });
-                            } else {
-                              player.loadVideoById({ videoId: videoId, startSeconds: resumeAt });
-                            }
-                            // Re-apply last requested rate shortly after reload
-                            if (lastRequestedRate != null) {
-                              setTimeout(function () {
-                                try { player.setPlaybackRate(lastRequestedRate); } catch (_) {}
-                              }, 500);
-                            }
-                          } catch (_) { /* ignore */ }
-                        }
-                      } else {
-
-                        if (Number.isFinite(t)) saveProgress(videoId, t);
-                      }
-                      lastTime = t;
-                    }
-                  } catch (_) { /* ignore */ }
-                }, detectionTimeInterval);
-
-              }
-            }
+            container.appendChild(host);
+            self.wrapperEl.appendChild(container);
+            return {
+              config: config,
+              container: container,
+              hostId: hostId,
+              player: null,
+              ready: false,
+              failed: false,
+              lastTime: 0
+            };
           });
         };
 
-        // Listen for commands from parent (e.g., extension content script)
+        YouTubePlayerController.prototype.initPlayers = function () {
+          if (typeof YT === "undefined" || !YT.Player) return;
+          var self = this;
+          var baseVars = {
+            autoplay: 1,
+            playsinline: 1,
+            rel: 0
+          };
+
+          if (this.listId) {
+            baseVars.listType = "playlist";
+            baseVars.list = this.listId;
+          }
+
+          if (this.startSeconds != null) {
+            baseVars.start = this.startSeconds;
+          }
+
+          this.candidates.forEach(function (candidate) {
+            var vars = Object.assign({}, baseVars, candidate.config.playerVars || {});
+            var playerOptions = {
+              width: "100%",
+              height: "100%",
+              videoId: self.videoId,
+              playerVars: vars,
+              events: {
+                onReady: function () { self.onCandidateReady(candidate); },
+                onStateChange: function (event) { self.onCandidateStateChange(candidate, event); },
+                onError: function (event) { self.onCandidateError(candidate, event); }
+              }
+            };
+
+            if (candidate.config.host) {
+              playerOptions.host = candidate.config.host;
+            }
+
+            candidate.player = new YT.Player(candidate.hostId, playerOptions);
+          });
+        };
+
+        YouTubePlayerController.prototype.onCandidateReady = function (candidate) {
+          candidate.ready = true;
+          try { candidate.player.mute(); } catch (_) { /* ignore */ }
+
+          if (!this.activeCandidate) {
+            this.activateCandidate(candidate);
+          } else if (this.pendingRate != null) {
+            this.applyPlaybackRate(candidate, this.pendingRate);
+          }
+        };
+
+        YouTubePlayerController.prototype.onCandidateStateChange = function (candidate, event) {
+          candidate.state = event.data;
+          if (event.data === YT.PlayerState.PLAYING) {
+            if (!this.activeCandidate || this.activeCandidate === candidate) {
+              this.activateCandidate(candidate);
+            } else if (this.activeCandidate && this.activeCandidate.failed) {
+              this.activateCandidate(candidate);
+            }
+          }
+        };
+
+        YouTubePlayerController.prototype.onCandidateError = function (candidate) {
+          candidate.failed = true;
+          if (this.activeCandidate === candidate) {
+            var fallback = this.findFallbackCandidate(candidate);
+            if (fallback) {
+              this.activateCandidate(fallback);
+            }
+          }
+        };
+
+        YouTubePlayerController.prototype.findFallbackCandidate = function (exclude) {
+          for (var i = 0; i < this.candidates.length; i++) {
+            var candidate = this.candidates[i];
+            if (candidate !== exclude && candidate.ready && !candidate.failed) {
+              return candidate;
+            }
+          }
+          return null;
+        };
+
+        function setCandidateVisibility(candidate, visible) {
+          if (!candidate || !candidate.container) return;
+          var displayValue = visible ? "block" : "none";
+          candidate.container.style.display = displayValue;
+          var iframe = candidate.container.querySelector("iframe");
+          if (iframe) iframe.style.display = displayValue;
+          var host = candidate.container.querySelector(".player-slot");
+          if (host && host !== iframe) host.style.display = displayValue;
+        }
+
+        YouTubePlayerController.prototype.activateCandidate = function (candidate) {
+          if (!candidate) return;
+          var alreadyActive = this.activeCandidate === candidate;
+          this.activeCandidate = candidate;
+
+          for (var i = 0; i < this.candidates.length; i++) {
+            var entry = this.candidates[i];
+            var shouldShow = entry === candidate;
+            setCandidateVisibility(entry, shouldShow);
+
+            if (!entry.player) continue;
+            try {
+              if (shouldShow) {
+                var activePlayer = entry.player;
+                activePlayer.playVideo();
+                setTimeout((function (p) {
+                  return function () {
+                    try { p.unMute(); } catch (_) { /* ignore */ }
+                  };
+                })(activePlayer), 0);
+                if (this.lastRequestedRate != null) {
+                  this.applyPlaybackRate(entry, this.lastRequestedRate);
+                } else if (this.pendingRate != null) {
+                  this.applyPlaybackRate(entry, this.pendingRate);
+                }
+                this.pendingRate = null;
+              } else {
+                entry.player.mute();
+                entry.player.pauseVideo();
+              }
+            } catch (_) { /* ignore */ }
+          }
+
+          if (!alreadyActive || !this.progressIntervalId) {
+            this.startProgressTracking();
+          }
+        };
+
+        YouTubePlayerController.prototype.applyPlaybackRate = function (candidate, rate) {
+          try {
+            if (candidate.player && typeof candidate.player.setPlaybackRate === "function") {
+              candidate.player.setPlaybackRate(rate);
+              return true;
+            }
+          } catch (_) { /* ignore */ }
+          return false;
+        };
+
+        YouTubePlayerController.prototype.setPlaybackRate = function (rate) {
+          var validated = validatePlaybackRate(rate);
+          this.lastRequestedRate = validated;
+
+          if (this.activeCandidate && this.applyPlaybackRate(this.activeCandidate, validated)) {
+            this.pendingRate = null;
+            return;
+          }
+
+          this.pendingRate = validated;
+        };
+
+        YouTubePlayerController.prototype.startProgressTracking = function () {
+          var self = this;
+          this.stopProgressTracking();
+
+          this.progressIntervalId = setInterval(function () {
+            var candidate = self.activeCandidate;
+            if (!candidate || !candidate.player) return;
+
+            try {
+              var player = candidate.player;
+              var currentTime = typeof player.getCurrentTime === "function" ? player.getCurrentTime() : NaN;
+              var state = typeof player.getPlayerState === "function" ? player.getPlayerState() : null;
+              var data = typeof player.getVideoData === "function" ? player.getVideoData() : null;
+
+              if (Number.isFinite(currentTime)) {
+                self.saveProgress(currentTime);
+              }
+
+              if (self.isAdPlayback(candidate, state, currentTime, data)) {
+                self.handleAdDetected(candidate);
+              } else if (Number.isFinite(currentTime)) {
+                candidate.lastTime = currentTime;
+              }
+            } catch (_) { /* ignore */ }
+          }, this.detectionInterval);
+        };
+
+        YouTubePlayerController.prototype.stopProgressTracking = function () {
+          if (this.progressIntervalId) {
+            clearInterval(this.progressIntervalId);
+            this.progressIntervalId = null;
+          }
+        };
+
+        YouTubePlayerController.prototype.isAdPlayback = function (candidate, state, currentTime, videoData) {
+          if (videoData && videoData.author === "") return true;
+          if (state === -1 && Number.isFinite(candidate.lastTime) && Number.isFinite(currentTime) && currentTime !== candidate.lastTime) {
+            return true;
+          }
+          return false;
+        };
+
+        YouTubePlayerController.prototype.handleAdDetected = function (candidate) {
+          var now = Date.now();
+          if (now - this.lastAdReloadAt < this.adReloadCooldownMs) return;
+          this.lastAdReloadAt = now;
+
+          var fallback = this.findFallbackCandidate(candidate);
+          if (fallback) {
+            this.activateCandidate(fallback);
+            return;
+          }
+
+          this.reloadCandidateAtProgress(candidate);
+        };
+
+        YouTubePlayerController.prototype.reloadCandidateAtProgress = function (candidate) {
+          var resumeAt = this.readProgress();
+          candidate.lastTime = resumeAt;
+          try {
+            if (this.listId) {
+              candidate.player.loadPlaylist({ playlistId: this.listId, startIndex: resumeAt });
+            } else {
+              candidate.player.loadVideoById({ videoId: this.videoId, startSeconds: resumeAt });
+            }
+
+            var self = this;
+            if (this.lastRequestedRate != null) {
+              setTimeout(function () {
+                self.applyPlaybackRate(candidate, self.lastRequestedRate);
+              }, 500);
+            }
+          } catch (_) { /* ignore */ }
+        };
+
+        YouTubePlayerController.prototype.handleBeforeUnload = function () {
+          try {
+            var candidate = this.activeCandidate;
+            if (candidate && candidate.player && typeof candidate.player.getCurrentTime === "function") {
+              var t = candidate.player.getCurrentTime();
+              if (Number.isFinite(t)) {
+                this.saveProgress(t);
+              }
+            }
+          } catch (_) { /* ignore */ }
+
+          this.stopProgressTracking();
+        };
+
+        var controller = new YouTubePlayerController({
+          videoId: videoId,
+          listId: listId,
+          startSeconds: startSec,
+          wrapperEl: wrapperEl,
+          candidateConfigs: candidateConfigs
+        });
+
+        createYouTubeApiScript();
+
+        window.onYouTubeIframeAPIReady = function () {
+          controller.initPlayers();
+
+          if (controller.pendingRate != null && controller.activeCandidate) {
+            controller.setPlaybackRate(controller.pendingRate);
+          }
+        };
+
         window.addEventListener("message", function (event) {
           var data = event.data;
           if (typeof data === "string") {
@@ -313,20 +457,12 @@
           }
           if (!data || typeof data !== "object") return;
           if (data.type === "setPlaybackRate") {
-            lastRequestedRate = Number(data.value);
-            safeSetRate(data.value);
+            controller.setPlaybackRate(data.value);
           }
         });
 
-        // Ensure we stop the interval and persist one last time on unload
         window.addEventListener("beforeunload", function () {
-          try {
-            if (player && typeof player.getCurrentTime === "function") {
-              var t = player.getCurrentTime();
-              if (Number.isFinite(t)) saveProgress(videoId, t);
-            }
-          } catch (_) { /* ignore */ }
-          try { if (progressIntervalId) clearInterval(progressIntervalId); } catch (_) {}
+          controller.handleBeforeUnload();
         });
       })();
     </script>
