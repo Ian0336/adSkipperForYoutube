@@ -1,9 +1,11 @@
 // 1. Logic for TOP FRAME (The UI overlay)
+
 if (window === window.top) {
   async function sendPlaybackRateToProxy(rate) {
     try {
       // Instead of postMessage to iframe, we broadcast to background
       // which will relay to all frames (including the inner video frame)
+      console.log("AdSkipper: Sending speed to proxy", rate);
       chrome.runtime.sendMessage({ type: "SET_SPEED", value: Number(rate) });
     } catch (_) {
       // no-op
@@ -14,6 +16,7 @@ if (window === window.top) {
   var resizeBtn = document.createElement("img");
   var reloadBtn = document.createElement("img");
   var accInput = document.createElement("input");
+
   var accelerator = 2;
   var past_url = "";
   var isResize = false;
@@ -379,15 +382,11 @@ if (window === window.top) {
     }
     console.log(newUrl);
     video.setAttribute("src", newUrl);
-    setTimeout(() => {
-      sendPlaybackRateToProxy(accelerator);
-    }, 1000); 
   }
   function add_drag_listener() {
     if (!checkElements()) {
       return;
     }
-    sendPlaybackRateToProxy(accelerator);
     targetTags = ["ytd-video-renderer", "yt-lockup-view-model", "ytd-rich-item-renderer", "ytd-thumbnail"]
 
     let listsSet = new Set();
@@ -439,6 +438,9 @@ if (window === window.top) {
       video.style["margin-left"] = "100px";
       fit_settings();
       saveSettings(); // Save settings after reset
+    } else if (message.type === "IFRAME_READY") {
+      console.log("AdSkipper: Iframe ready signal received, syncing speed.");
+      sendPlaybackRateToProxy(accelerator);
     }
   };
 
@@ -478,10 +480,7 @@ if (window === window.top) {
     if (display && document.querySelector('iframe[id="NoAddMyvideo"]')) {
       delete_other_player();
       try {
-        sendPlaybackRateToProxy(accelerator);
-          
         if_change_url_or_not();
-        setTimeout(() => { sendPlaybackRateToProxy(accelerator); }, 1000);
       } catch (e) {
         console.error("Error setting playback rate:", e);
       }
@@ -527,23 +526,26 @@ if (window === window.top) {
 
   chrome.runtime.onMessage.addListener(onMessage);
 
-} // END of window.top check
+}else{
 
+  // 2. Logic for ALL FRAMES without top frame
+  // This part runs in the iframe as well (thanks to all_frames: true)
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "SET_SPEED") {
+      var rate = Number(message.value);
+      if (!Number.isFinite(rate)) return;
+      console.log("AdSkipper: Received speed from proxy", rate);
 
-// 2. Logic for ALL FRAMES (The Playback Control)
-// This part runs in the iframe as well (thanks to all_frames: true)
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "SET_SPEED") {
-    var rate = Number(message.value);
-    if (!Number.isFinite(rate)) return;
-
-    // Try to find the video element and set rate
-    var videos = document.getElementsByTagName("video");
-    for (var i = 0; i < videos.length; i++) {
-        try {
-            videos[i].playbackRate = rate;
-            console.log("AdSkipper: Set direct speed to", rate);
-        } catch(e) { /* ignore */ }
+      // Try to find the video element and set rate
+      var videos = document.getElementsByTagName("video");
+      for (var i = 0; i < videos.length; i++) {
+          try {
+              videos[i].playbackRate = rate;
+              console.log("AdSkipper: Set direct speed to", rate);
+          } catch(e) { /* ignore */ }
+      }
     }
-  }
-});
+  });
+  // Send ready signal to let top frame know we are here
+  chrome.runtime.sendMessage({ type: "IFRAME_READY" });
+}
