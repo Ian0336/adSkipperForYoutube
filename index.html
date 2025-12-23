@@ -23,9 +23,7 @@
     </style>
   </head>
   <body>
-    <div id="playerWrapper" style="display:none;">
-      <div id="player"></div>
-    </div>
+    <div id="playerWrapper" style="display:none;"></div>
 
     <div id="message">
       <div>
@@ -128,15 +126,19 @@
           this.progressStore = Object.create(null);
           this.pendingRate = null;
           this.lastRequestedRate = null;
-          this.candidates = [];
+          // this.candidates will now hold objects that may or may not have a constructed player/DOM yet
+          // { config, ready, failed, player, container, hostId, ... }
+          this.candidates = []; 
           this.activeCandidate = null;
           this.progressIntervalId = null;
           this.detectionInterval = 500;
           this.lastAdReloadAt = 0;
+          
           this.adReloadCooldownMs = 1000;
 
           this.resetProgress();
-          this.setupCandidateContainers();
+          // Initialize the candidates array structure but don't create DOM/Players yet
+          this.setupCandidatesMeta();
         }
 
         YouTubePlayerController.prototype.resetProgress = function () {
@@ -155,44 +157,63 @@
           return Number.isFinite(t) && t >= 0 ? t : 0;
         };
 
-        YouTubePlayerController.prototype.setupCandidateContainers = function () {
-          if (!this.wrapperEl) return;
-          this.wrapperEl.innerHTML = "";
-
+        // Initialize metadata for candidates without creating DOM
+        YouTubePlayerController.prototype.setupCandidatesMeta = function () {
           var self = this;
           this.candidates = this.candidateConfigs.map(function (config, index) {
             var suffix = config.idSuffix || "candidate-" + index;
             var hostId = index === 0 ? "player" : "player-" + suffix;
-
-            var container = document.createElement("div");
-            container.className = "player-slot-wrapper";
-            container.style.width = "100%";
-            container.style.height = "100%";
-            container.style.position = "relative";
-            container.style.display = "none";
-
-            var host = document.createElement("div");
-            host.id = hostId;
-            host.className = "player-slot";
-            host.style.width = "100%";
-            host.style.height = "100%";
-
-            container.appendChild(host);
-            self.wrapperEl.appendChild(container);
             return {
+              index: index,
               config: config,
-              container: container,
               hostId: hostId,
-              player: null,
+              container: null, // Will be created on demand
+              player: null,    // Will be created on demand
               ready: false,
               failed: false,
-              lastTime: 0
+              lastTime: 0,
+              initializing: false
             };
           });
         };
 
+        // Initialize only the first player
         YouTubePlayerController.prototype.initPlayers = function () {
-          if (typeof YT === "undefined" || !YT.Player) return;
+            if (this.candidates.length > 0) {
+                this.ensureCandidateInitialized(this.candidates[0]);
+            }
+        };
+
+        // Create DOM and YT.Player for a specific candidate if not already done
+        YouTubePlayerController.prototype.ensureCandidateInitialized = function (candidate) {
+          if (candidate.player || candidate.initializing || candidate.failed) return;
+          
+          candidate.initializing = true;
+
+          // 1. Create DOM structure
+          var container = document.createElement("div");
+          container.className = "player-slot-wrapper";
+          container.style.width = "100%";
+          container.style.height = "100%";
+          container.style.position = "relative";
+          container.style.display = "none";
+
+          var host = document.createElement("div");
+          host.id = candidate.hostId;
+          host.className = "player-slot";
+          host.style.width = "100%";
+          host.style.height = "100%";
+
+          container.appendChild(host);
+          this.wrapperEl.appendChild(container);
+          candidate.container = container;
+
+          // 2. Init Player
+          if (typeof YT === "undefined" || !YT.Player) {
+              candidate.initializing = false;
+              return; // Should retry later when API is ready
+          }
+
           var self = this;
           var baseVars = {
             autoplay: 1,
@@ -205,21 +226,33 @@
             baseVars.list = this.listId;
           }
 
-          if (this.startSeconds != null) {
-            baseVars.start = this.startSeconds;
+          var startSec = this.startSeconds;
+          // If we are initializing a backup player mid-playback, try to start at current progress
+          if (candidate.index > 0) {
+              var currentProg = this.readProgress();
+              if (currentProg > 0) startSec = currentProg;
           }
 
-          this.candidates.forEach(function (candidate) {
-            var vars = Object.assign({}, baseVars, candidate.config.playerVars || {});
+          if (startSec != null) {
+            baseVars.start = startSec;
+          }
+
+          var vars = Object.assign({}, baseVars, candidate.config.playerVars || {});
             var playerOptions = {
               width: "100%",
               height: "100%",
               videoId: self.videoId,
               playerVars: vars,
               events: {
-                onReady: function () { self.onCandidateReady(candidate); },
+                onReady: function () { 
+                    candidate.initializing = false;
+                    self.onCandidateReady(candidate); 
+                },
                 onStateChange: function (event) { self.onCandidateStateChange(candidate, event); },
-                onError: function (event) { self.onCandidateError(candidate, event); }
+                onError: function (event) { 
+                    candidate.initializing = false;
+                    self.onCandidateError(candidate, event); 
+                }
               }
             };
 
@@ -228,16 +261,20 @@
             }
 
             candidate.player = new YT.Player(candidate.hostId, playerOptions);
-          });
         };
 
         YouTubePlayerController.prototype.onCandidateReady = function (candidate) {
           candidate.ready = true;
           try { candidate.player.mute(); } catch (_) { /* ignore */ }
 
+          // If this is the very first one or we need a fallback, activate it
           if (!this.activeCandidate) {
             this.activateCandidate(candidate);
-          } else if (this.pendingRate != null) {
+          } else if (this.activeCandidate.failed && this.activeCandidate !== candidate) {
+             this.activateCandidate(candidate);
+          } 
+          
+          if (this.pendingRate != null) {
             this.applyPlaybackRate(candidate, this.pendingRate);
           }
         };
@@ -245,9 +282,10 @@
         YouTubePlayerController.prototype.onCandidateStateChange = function (candidate, event) {
           candidate.state = event.data;
           if (event.data === YT.PlayerState.PLAYING) {
+            // If we are actively looking for a working candidate (e.g. current one failed or is ad), switch
             if (!this.activeCandidate || this.activeCandidate === candidate) {
               this.activateCandidate(candidate);
-            } else if (this.activeCandidate && this.activeCandidate.failed) {
+            } else if (this.activeCandidate && (this.activeCandidate.failed)) {
               this.activateCandidate(candidate);
             }
           }
@@ -255,22 +293,48 @@
 
         YouTubePlayerController.prototype.onCandidateError = function (candidate) {
           candidate.failed = true;
+          // If the current active one failed, try to find next or create next
           if (this.activeCandidate === candidate) {
-            var fallback = this.findFallbackCandidate(candidate);
-            if (fallback) {
-              this.activateCandidate(fallback);
-            }
+            this.switchToNextAvailableCandidate(candidate);
           }
         };
 
-        YouTubePlayerController.prototype.findFallbackCandidate = function (exclude) {
-          for (var i = 0; i < this.candidates.length; i++) {
-            var candidate = this.candidates[i];
-            if (candidate !== exclude && candidate.ready && !candidate.failed) {
-              return candidate;
+        // Attempts to switch to an existing ready candidate, OR triggers creation of the next one
+        YouTubePlayerController.prototype.switchToNextAvailableCandidate = function (currentBadCandidate) {
+            // 1. Try to find an already ready candidate
+            for (var i = 0; i < this.candidates.length; i++) {
+                var c = this.candidates[i];
+                if (c !== currentBadCandidate && c.ready && !c.failed && c.player) {
+                    this.activateCandidate(c);
+                    return;
+                }
             }
-          }
-          return null;
+
+            // 2. If no ready candidate, find the next uninitialized one and init it
+            // We search starting from the current candidate's index + 1
+            var nextIndex = (currentBadCandidate.index + 1) % this.candidates.length;
+            // Loop once to find the first non-failed, non-initialized one
+            for (var k = 0; k < this.candidates.length; k++) {
+                var idx = (nextIndex + k) % this.candidates.length;
+                var potential = this.candidates[idx];
+                if (potential !== currentBadCandidate && !potential.failed && !potential.ready && !potential.initializing) {
+                    // Found a candidate to lazy load
+                    this.ensureCandidateInitialized(potential);
+                    return; 
+                }
+            }
+        };
+        
+        // Old method kept for compatibility, but logic is now in switchToNextAvailableCandidate mostly
+        YouTubePlayerController.prototype.findFallbackCandidate = function (exclude) {
+             // This is purely for "is there a ready one NOW"
+            for (var i = 0; i < this.candidates.length; i++) {
+                var candidate = this.candidates[i];
+                if (candidate !== exclude && candidate.ready && !candidate.failed && candidate.player) {
+                return candidate;
+                }
+            }
+            return null;
         };
 
         function setCandidateVisibility(candidate, visible) {
@@ -288,8 +352,13 @@
           var alreadyActive = this.activeCandidate === candidate;
           this.activeCandidate = candidate;
 
+          // Hide others, Show this one
           for (var i = 0; i < this.candidates.length; i++) {
             var entry = this.candidates[i];
+            
+            // If entry is not initialized, nothing to hide/show
+            if (!entry.container) continue;
+
             var shouldShow = entry === candidate;
             setCandidateVisibility(entry, shouldShow);
 
@@ -353,7 +422,10 @@
 
             try {
               var player = candidate.player;
-              var currentTime = typeof player.getCurrentTime === "function" ? player.getCurrentTime() : NaN;
+              // Safety check: accessing methods on destroyed or unready player
+              if (typeof player.getCurrentTime !== "function") return;
+
+              var currentTime = player.getCurrentTime();
               var state = typeof player.getPlayerState === "function" ? player.getPlayerState() : null;
               var data = typeof player.getVideoData === "function" ? player.getVideoData() : null;
 
@@ -390,15 +462,11 @@
           if (now - this.lastAdReloadAt < this.adReloadCooldownMs) return;
           this.lastAdReloadAt = now;
 
-          var fallback = this.findFallbackCandidate(candidate);
-          if (fallback) {
-            this.activateCandidate(fallback);
-            return;
-          }
-
-          this.reloadCandidateAtProgress(candidate);
+          // "Ad detected" means we want to switch
+          this.switchToNextAvailableCandidate(candidate);
         };
 
+        // This is now used only if we have NO other candidates to switch to
         YouTubePlayerController.prototype.reloadCandidateAtProgress = function (candidate) {
           var resumeAt = this.readProgress();
           candidate.lastTime = resumeAt;
