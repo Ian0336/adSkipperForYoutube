@@ -20,7 +20,7 @@ if (window === window.top) {
   var isMove = false;
   var pre_mouse = { x: 0, y: 0 };
   var display = true;
-  var baseUrl = "https://ian0336.github.io/adSkipperForYoutube-chrome_extention";
+  var baseUrl = "https://ian0336.github.io/adSkipperForYoutube";
   // var baseUrl = "http://localhost:5500";
 
   // Load settings from localStorage
@@ -74,6 +74,9 @@ if (window === window.top) {
     if (document.querySelector('input[alt="resize"]')) {
       document.querySelector('input[alt="resize"]').remove();
     }
+    if (document.querySelector('img[alt="reload"]')) {
+      document.querySelector('img[alt="reload"]').remove();
+    }
   }
 
   function checkElements() {
@@ -87,6 +90,9 @@ if (window === window.top) {
       return false;
     }
     if (!document.querySelector('input[alt="resize"]')) {
+      return false;
+    }
+    if (!document.querySelector('img[alt="reload"]')) {
       return false;
     }
     return true;
